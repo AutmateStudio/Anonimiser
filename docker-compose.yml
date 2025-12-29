@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  anonymizer-service:
+    build: .
+    container_name: presidio_ru_api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    # Лимиты ресурсов (опционально, так как модель lg ест память)
+    deploy:
+      resources:
+        limits:
+          memory: 2G
