@@ -1,355 +1,183 @@
+"""
+Сервис анонимизации персональных данных с использованием DeepPavlov NER
+"""
 import time
 import re
 from typing import Dict, List
 from fastapi import FastAPI
 from pydantic import BaseModel
-from presidio_analyzer import AnalyzerEngine, RecognizerRegistry, PatternRecognizer, Pattern
-from presidio_analyzer.nlp_engine import NlpEngineProvider
-from presidio_analyzer.entities import RecognizerResult
-from presidio_analyzer.nlp_engine import NlpArtifacts
-from presidio_anonymizer import AnonymizerEngine
-from presidio_anonymizer.entities import OperatorConfig
 
-app = FastAPI(title="Anonymization Service")
+# Импорт DeepPavlov
+try:
+    from deeppavlov import build_model, configs
+    DEEPPAVLOV_AVAILABLE = True
+except ImportError:
+    print("DeepPavlov не установлен. Установите: pip install deeppavlov")
+    DEEPPAVLOV_AVAILABLE = False
 
-# --- Инициализация Presidio ---
+app = FastAPI(title="Anonymization Service (DeepPavlov)")
 
-configuration = {
-    "nlp_engine_name": "spacy",
-    "models": [{"lang_code": "ru", "model_name": "ru_core_news_lg"}]
-}
-provider = NlpEngineProvider(nlp_configuration=configuration)
-nlp_engine = provider.create_engine()
+# --- Инициализация DeepPavlov NER модели ---
 
-registry = RecognizerRegistry()
-registry.load_predefined_recognizers(nlp_engine=nlp_engine)
+ner_model = None
+if DEEPPAVLOV_AVAILABLE:
+    try:
+        print("Загрузка DeepPavlov NER модели...")
+        # Используем модель ner_rus_bert для русского языка
+        ner_model = build_model('ner_rus_bert', download=True)
+        print("DeepPavlov NER модель загружена успешно!")
+    except Exception as e:
+        print(f"Ошибка загрузки DeepPavlov модели: {e}")
+        ner_model = None
 
-# --- Улучшенный рекогнайзер адресов с комбинацией паттернов и NLP ---
 
-class EnhancedAddressRecognizer(PatternRecognizer):
-    """Улучшенный рекогнайзер адресов, использующий паттерны и NLP"""
+# --- Паттерны для распознавания персональных данных ---
+
+class PatternRecognizer:
+    """Класс для распознавания сущностей по паттернам"""
     
-    def __init__(self, nlp_engine, supported_language="ru"):
-        # Улучшенные паттерны для различных форматов адресов
-        patterns = [
-            # Линия с номером дома (4 линия д.41, 1-я линия, 2-я линия В.О. д.5) - ПРИОРИТЕТНЫЙ
-            Pattern(
-                name="line_address",
-                regex=r"(?i)\d+(?:-я|-й|-е|-ая|-ый|-ое)?\s+линия(?:\s+[А-ЯЁа-яё\.]+)?(?:\s*[,]?\s*)?(?:д\.?\s*\d+[А-ЯЁа-яё]?|дом\s*\d+[А-ЯЁа-яё]?)?",
-                score=0.7
-            ),
-            # Линия с домом через точку (4 линия д.41) - упрощенный вариант
-            Pattern(
-                name="line_address_dot",
-                regex=r"(?i)\d+(?:-я|-й|-е|-ая|-ый|-ое)?\s+линия\s+д\.\d+",
-                score=0.7
-            ),
-            # Проспект с сокращением "пр" (северный пр 69, центральный пр 10) - ПРИОРИТЕТНЫЙ
-            Pattern(
-                name="prospect_short",
-                regex=r"(?i)[А-ЯЁа-яё]+(?:ый|ий|ой|ая|ое)\s+пр\s+\d+[А-ЯЁа-яё]?",
-                score=0.7
-            ),
-            # Проспект с сокращением "пр" - упрощенный вариант без окончаний
-            Pattern(
-                name="prospect_short_simple",
-                regex=r"(?i)(?:северный|южный|восточный|западный|центральный|красный|зеленый|синий|новый|старый)\s+пр\s+\d+",
-                score=0.7
-            ),
-            # Проспект с прилагательным и номером (северный проспект 69, центральный проспект 10)
-            Pattern(
-                name="prospect_with_adj",
-                regex=r"(?i)[А-ЯЁа-яё]+(?:ый|ий|ой|ая|ое)\s+(?:пр-т|проспект|пр\.)\s+\d+[А-ЯЁа-яё]?",
-                score=0.7
-            ),
-            # Полный адрес с городом, улицей, домом, квартирой
-            Pattern(
-                name="full_address",
-                regex=r"(?i)(?:г|город|г\.)\s+[А-ЯЁа-яё\-]+(?:\s*,\s*)?(?:(?:ул|улица|ул\.|пр-т|проспект|пр\.|наб|набережная|наб\.|пер|переулок|пер\.|ш|шоссе|ш\.|б-р|бульвар|б-р\.)\s+[А-ЯЁа-яё0-9\-\.]+)?(?:\s*,\s*)?(?:(?:д|дом|д\.|стр|строение|стр\.|корп|корпус|корп\.|к|к\.)\s*[А-ЯЁа-яё0-9\-]+)?(?:\s*,\s*)?(?:(?:кв|квартира|кв\.|оф|офис|оф\.)\s*[А-ЯЁа-яё0-9\-]+)?",
-                score=0.7
-            ),
-            # Улица с номером дома (Кавалергардская 12Б, Комсомола 7, Авиаконструкторов 54)
-            Pattern(
-                name="street_with_number",
-                regex=r"(?i)\b[А-ЯЁа-яё][А-ЯЁа-яё\-]+(?:ская|скаяя|ской|ая|ий|ый|ой|ое|ов|а|ы|и|е)\s+(?:д\.?\s*)?\d+[А-ЯЁа-яё]?\b",
-                score=0.7
-            ),
-            # Улица с домом и квартирой (ул. Новая, д. 1, кв. 5)
-            Pattern(
-                name="street_house_apt",
-                regex=r"(?i)(?:ул|улица|ул\.|пр-т|проспект|пр\.|наб|набережная|наб\.|пер|переулок|пер\.|ш|шоссе|ш\.)\s+[А-ЯЁа-яё\-]+(?:\s*,\s*)?(?:(?:д|дом|д\.)\s*[А-ЯЁа-яё0-9\-]+)?(?:\s*,\s*)?(?:(?:к|к\.|корп|корпус|корп\.)\s*[А-ЯЁа-яё0-9\-]+)?(?:\s*,\s*)?(?:(?:кв|квартира|кв\.|оф|офис|оф\.)\s*[А-ЯЁа-яё0-9\-]+)?",
-                score=0.7
-            ),
-            # Шоссе с домом (Южное шоссе, д. 53 к 4)
-            Pattern(
-                name="highway_address",
-                regex=r"(?i)\b[А-ЯЁа-яё]+(?:ое|ая|ий|ый|ой)\s+(?:ш|шоссе|ш\.)(?:\s*,\s*)?(?:(?:д|дом|д\.)\s*[А-ЯЁа-яё0-9\-]+)?(?:\s*,\s*)?(?:(?:к|к\.|корп|корпус|корп\.)\s*[А-ЯЁа-яё0-9\-]+)?",
-                score=0.7
-            ),
-            # Квартира с подъездом и этажом (Квартира 23, 3 парадная, Этаж 10)
-            Pattern(
-                name="apartment_details",
-                regex=r"(?i)(?:кв|квартира|кв\.)\s*[А-ЯЁа-яё0-9\-]+(?:\s*,\s*)?(?:(?:\d+\s+)?(?:парадная|подъезд|подъезд\s*\d+))?(?:\s*,\s*)?(?:(?:этаж|эт\.)\s*\d+)?",
-                score=0.7
-            ),
-            # Метро и адрес рядом (метро площадь Ленина, 10 минут от метро)
-            Pattern(
-                name="metro_address",
-                regex=r"(?i)метро\s+[А-ЯЁа-яё\-]+(?:\s+[А-ЯЁа-яё\-]+)*(?:\s*,\s*)?(?:\d+\s+минут\s+от\s+метро)?(?:\s*,\s*)?[А-ЯЁа-яё\-]+\s+\d+",
-                score=0.7
-            ),
-            # Адрес с навигационными указаниями (по навигатору Яндекса - это Кирочная 54К)
-            Pattern(
-                name="navigation_address",
-                regex=r"(?i)(?:по\s+навигатору|по\s+навигации|это)\s+[А-ЯЁа-яё\-]+\s+\d+[А-ЯЁа-яё]?",
-                score=0.65
-            ),
-            # Простой адрес: название улицы/площади с номером
-            Pattern(
-                name="simple_street",
-                regex=r"(?i)\b(?:площадь|пл\.|сквер|парк)\s+[А-ЯЁа-яё\-]+(?:\s+[А-ЯЁа-яё\-]+)*(?:\s*,\s*)?\d+[А-ЯЁа-яё]?",
-                score=0.7
-            ),
-            # Адрес с подъездом (3 парадная, подъезд 38)
-            Pattern(
-                name="entrance_address",
-                regex=r"(?i)(?:подъезд|парадная|парадная\s*\d+)\s*\d+",
-                score=0.65
-            ),
-            # Адрес с этажом (Этаж 10, 10 этаж)
-            Pattern(
-                name="floor_address",
-                regex=r"(?i)(?:этаж|эт\.)\s*\d+",
-                score=0.6
-            ),
-        ]
-        
-        super().__init__(
-            supported_entity="ADDRESS",
-            name="RU_ADDRESS_ENHANCED",
-            supported_language=supported_language,
-            patterns=patterns
-        )
-        self.nlp_engine = nlp_engine
+    def __init__(self):
+        self.patterns = {
+            "PHONE_NUMBER": [
+                PatternInfo(
+                    regex=r'(\+7|8|7)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}',
+                    score=0.9
+                )
+            ],
+            "INN": [
+                PatternInfo(
+                    regex=r'\b\d{10}\b',
+                    score=0.9
+                ),
+                PatternInfo(
+                    regex=r'\b\d{12}\b',
+                    score=0.9
+                ),
+            ],
+            "PASSPORT": [
+                PatternInfo(
+                    regex=r'(?:паспорт\s*)?(?:серия\s*)?(?:\d{2}\s?\d{2}|\d{4})[\s\-]?(?:номер\s*)?\d{6}',
+                    score=0.95
+                ),
+            ],
+            "ADDRESS": [
+                # Проспект с сокращением "пр" - МАКСИМАЛЬНЫЙ ПРИОРИТЕТ
+                PatternInfo(
+                    regex=r"(?i)(?:северный|южный|восточный|западный|центральный|красный|зеленый|синий|новый|старый)\s+пр\s+\d+",
+                    score=0.95
+                ),
+                # Линия с домом через точку
+                PatternInfo(
+                    regex=r"(?i)\d+(?:-я|-й|-е|-ая|-ый|-ое)?\s+линия\s+д\.\d+[А-ЯЁа-яё]?",
+                    score=0.95
+                ),
+                # Проспект с прилагательным
+                PatternInfo(
+                    regex=r"(?i)[А-ЯЁа-яё]+(?:ый|ий|ой|ая|ое)\s+пр\s+\d+",
+                    score=0.9
+                ),
+                # Линия с номером дома
+                PatternInfo(
+                    regex=r"(?i)\d+(?:-я|-й|-е|-ая|-ый|-ое)?\s+линия(?:\s+[А-ЯЁа-яё\.]+)?(?:\s*[,]?\s*)?(?:д\.?\s*\d+[А-ЯЁа-яё]?|дом\s*\d+[А-ЯЁа-яё]?)?",
+                    score=0.9
+                ),
+                # Полный адрес
+                PatternInfo(
+                    regex=r"(?i)(?:г|город|г\.)\s+[А-ЯЁа-яё\-]+(?:\s*,\s*)?(?:(?:ул|улица|ул\.|пр-т|проспект|пр\.|наб|набережная|наб\.|пер|переулок|пер\.|ш|шоссе|ш\.|б-р|бульвар|б-р\.)\s+[А-ЯЁа-яё0-9\-\.]+)?(?:\s*,\s*)?(?:(?:д|дом|д\.|стр|строение|стр\.|корп|корпус|корп\.|к|к\.)\s*[А-ЯЁа-яё0-9\-]+)?(?:\s*,\s*)?(?:(?:кв|квартира|кв\.|оф|офис|оф\.)\s*[А-ЯЁа-яё0-9\-]+)?",
+                    score=0.85
+                ),
+                # Улица с номером дома
+                PatternInfo(
+                    regex=r"(?i)\b[А-ЯЁа-яё][А-ЯЁа-яё\-]+(?:ская|скаяя|ской|ая|ий|ый|ой|ое|ов|а|ы|и|е)\s+(?:д\.?\s*)?\d+[А-ЯЁа-яё]?\b",
+                    score=0.8
+                ),
+                # Шоссе с домом
+                PatternInfo(
+                    regex=r"(?i)\b[А-ЯЁа-яё]+(?:ое|ая|ий|ый|ой)\s+(?:ш|шоссе|ш\.)(?:\s*,\s*)?(?:(?:д|дом|д\.)\s*[А-ЯЁа-яё0-9\-]+)?",
+                    score=0.8
+                ),
+                # Квартира с подъездом
+                PatternInfo(
+                    regex=r"(?i)(?:кв|квартира|кв\.)\s*[А-ЯЁа-яё0-9\-]+(?:\s*,\s*)?(?:(?:\d+\s+)?(?:парадная|подъезд|подъезд\s*\d+))?(?:\s*,\s*)?(?:(?:этаж|эт\.)\s*\d+)?",
+                    score=0.7
+                ),
+                # Метро и адрес
+                PatternInfo(
+                    regex=r"(?i)метро\s+[А-ЯЁа-яё\-]+(?:\s+[А-ЯЁа-яё\-]+)*(?:\s*,\s*)?(?:\d+\s+минут\s+от\s+метро)?(?:\s*,\s*)?[А-ЯЁа-яё\-]+\s+\d+",
+                    score=0.7
+                ),
+            ]
+        }
     
-    def enhance_using_nlp(self, text: str, nlp_artifacts: NlpArtifacts) -> List[RecognizerResult]:
-        """Использует NLP для улучшения распознавания адресов"""
+    def recognize(self, text: str) -> List[Dict]:
+        """Распознает сущности по паттернам"""
         results = []
         
-        # Сначала ищем специфичные паттерны через регулярные выражения
-        # Проспект с "пр" (северный пр 69)
-        prospect_pattern = r'(?i)([А-ЯЁа-яё]+(?:ый|ий|ой|ая|ое))\s+пр\s+(\d+[А-ЯЁа-яё]?)'
-        for match in re.finditer(prospect_pattern, text):
-            result = RecognizerResult(
-                entity_type="ADDRESS",
-                start=match.start(),
-                end=match.end(),
-                score=0.8
-            )
-            results.append(result)
-        
-        # Линия с домом (4 линия д.41)
-        line_pattern = r'(?i)(\d+(?:-я|-й|-е|-ая|-ый|-ое)?\s+линия(?:\s+[А-ЯЁа-яё\.]+)?(?:\s*[,]?\s*)?(?:д\.?\s*\d+[А-ЯЁа-яё]?|дом\s*\d+[А-ЯЁа-яё]?)?)'
-        for match in re.finditer(line_pattern, text):
-            result = RecognizerResult(
-                entity_type="ADDRESS",
-                start=match.start(),
-                end=match.end(),
-                score=0.8
-            )
-            results.append(result)
-        
-        # Используем Spacy для распознавания локаций
-        doc = nlp_artifacts.doc
-        
-        # Ищем именованные сущности типа LOC (локация) и GPE (геополитическая сущность)
-        for ent in doc.ents:
-            if ent.label_ in ["LOC", "GPE"] and len(ent.text) > 3:
-                # Проверяем, что это похоже на адрес (содержит цифры или адресные слова)
-                text_lower = ent.text.lower()
-                address_indicators = ['ул', 'улица', 'проспект', 'пр', 'пр-т', 'шоссе', 'площадь', 'дом', 'квартира', 
-                                     'метро', 'район', 'город', 'область', 'д.', 'кв.', 'стр.', 'линия']
-                
-                # Если содержит индикаторы адреса или цифры - считаем адресом
-                if any(indicator in text_lower for indicator in address_indicators) or \
-                   any(char.isdigit() for char in ent.text):
-                    # Ищем позицию в исходном тексте
-                    start = ent.start_char
-                    end = ent.end_char
-                    
-                    # Расширяем контекст - ищем номер дома/квартиры рядом
-                    context_start = max(0, start - 50)
-                    context_end = min(len(text), end + 50)
-                    context = text[context_start:context_end]
-                    
-                    # Ищем паттерны номеров рядом с локацией
-                    number_pattern = r'\d+[А-ЯЁа-яё]?'
-                    numbers_before = re.findall(number_pattern, text[max(0, start-20):start])
-                    numbers_after = re.findall(number_pattern, text[end:min(len(text), end+20)])
-                    
-                    # Если есть номера рядом, расширяем границы
-                    if numbers_after:
-                        # Ищем номер после локации
-                        match_after = re.search(r'\s+\d+[А-ЯЁа-яё]?', text[end:end+30])
-                        if match_after:
-                            end = end + match_after.end()
-                    
-                    if numbers_before and not any(char.isdigit() for char in ent.text):
-                        # Если номер перед локацией, расширяем начало
-                        match_before = re.search(r'\d+[А-ЯЁа-яё]?\s+[А-ЯЁа-яё]+', text[max(0, start-30):start+len(ent.text)])
-                        if match_before:
-                            start = max(0, start - 30) + match_before.start()
-                    
-                    result = RecognizerResult(
-                        entity_type="ADDRESS",
-                        start=start,
-                        end=end,
-                        score=0.75  # Средний score для NLP результатов
-                    )
-                    results.append(result)
+        for entity_type, patterns in self.patterns.items():
+            for pattern_info in patterns:
+                for match in re.finditer(pattern_info.regex, text):
+                    results.append({
+                        "entity": entity_type,
+                        "start": match.start(),
+                        "end": match.end(),
+                        "text": match.group(),
+                        "score": pattern_info.score
+                    })
         
         return results
-    
-    def analyze(self, text: str, entities=None, nlp_artifacts=None):
-        """Переопределяем analyze для комбинации паттернов и NLP"""
-        # Сначала используем паттерны
-        pattern_results = super().analyze(text, entities, nlp_artifacts)
-        
-        # Затем используем NLP, если доступны nlp_artifacts
-        nlp_results = []
-        if nlp_artifacts:
-            nlp_results = self.enhance_using_nlp(text, nlp_artifacts)
-        
-        # Объединяем результаты
-        all_results = list(pattern_results) + nlp_results
-        
-        # Удаляем дубликаты и перекрывающиеся результаты
-        filtered_results = self._merge_results(all_results)
-        
-        return filtered_results
-    
-    def _merge_results(self, results: List[RecognizerResult]) -> List[RecognizerResult]:
-        """Объединяет и фильтрует перекрывающиеся результаты"""
-        if not results:
-            return []
-        
-        # Сортируем по позиции начала
-        sorted_results = sorted(results, key=lambda x: x.start)
-        merged = []
-        
-        for result in sorted_results:
-            # Проверяем, не перекрывается ли с уже добавленными
-            overlaps = False
-            for existing in merged:
-                # Если перекрываются, берем результат с большим score
-                if not (result.end <= existing.start or result.start >= existing.end):
-                    overlaps = True
-                    if result.score > existing.score:
-                        # Заменяем существующий результат
-                        merged.remove(existing)
-                        merged.append(result)
-                    break
-            
-            if not overlaps:
-                merged.append(result)
-        
-        return merged
 
 
-# Создаем улучшенный рекогнайзер адресов
-address_recognizer = EnhancedAddressRecognizer(nlp_engine=nlp_engine)
-
-phone_recognizer = PatternRecognizer(
-    supported_entity="PHONE_NUMBER",
-    name="RU_PHONE",
-    supported_language="ru",
-    patterns=[
-        Pattern(name="phone", regex=r'(\+7|8|7)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}', score=0.8)]
-)
-
-inn_recognizer = PatternRecognizer(
-    supported_entity="INN",
-    name="RU_INN",
-    supported_language="ru",
-    patterns=[Pattern(name="inn", regex=r'\b\d{10}\b|\b\d{12}\b', score=0.8)]
-)
-
-passport_recognizer = PatternRecognizer(
-    supported_entity="PASSPORT",
-    name="RU_PASSPORT",
-    supported_language="ru",
-    patterns=[Pattern(
-        name="passport",
-        regex=r"(?<!\d)(?:паспорт\s*)?(?:серия\s*)?(?:\d{2}\s?\d{2}|\d{4})[\s\-]?(?:номер\s*)?\d{6}(?!\d)",
-        score=0.95
-    )]
-)
-
-registry.add_recognizer(address_recognizer)
-registry.add_recognizer(phone_recognizer)
-registry.add_recognizer(inn_recognizer)
-registry.add_recognizer(passport_recognizer)
-
-analyzer = AnalyzerEngine(nlp_engine=nlp_engine, registry=registry)
-anonymizer_engine = AnonymizerEngine()
+class PatternInfo:
+    """Информация о паттерне"""
+    def __init__(self, regex: str, score: float):
+        self.regex = regex
+        self.score = score
 
 
-# --- Функции постобработки для улучшения качества распознавания имен ---
+pattern_recognizer = PatternRecognizer()
+
+
+# --- Функции постобработки ---
 
 def clean_name_text(text: str) -> str:
     """Очищает захваченный текст имени от лишних данных"""
     if not text:
         return text
     
-    # Удаляем переносы строк и лишние пробелы
     text = re.sub(r'\s+', ' ', text.strip())
     
-    # Список ключевых слов, которые не должны быть в имени
     stop_words = ['время', 'место', 'номер', 'телефон', 'адрес', 'дата', 
                   'день', 'месяц', 'год', 'лет', 'часов', 'минут',
                   'квартира', 'подъезд', 'этаж', 'дом', 'улица', 'сообщу']
     
-    # Разбиваем на слова
     words = text.split()
-    
-    # Фильтруем слова: берем только те, которые не являются стоп-словами
-    # и выглядят как имена (начинаются с заглавной буквы, содержат только буквы)
     cleaned_words = []
+    
     for word in words:
-        # Удаляем знаки препинания в начале/конце
         word_clean = word.strip('.,!?;:()[]{}"\'-')
         
-        # Пропускаем пустые слова
         if not word_clean:
             continue
         
-        # Проверяем, что это не стоп-слово
         if word_clean.lower() in stop_words:
-            break  # Прерываем, если встретили стоп-слово
+            break
         
-        # Проверяем, что слово выглядит как имя (начинается с заглавной, только буквы)
-        # Имена обычно состоят из букв и могут содержать дефис
         if word_clean[0].isupper() and (word_clean.replace('-', '').isalpha() or 
-                                         (len(word_clean) <= 3 and word_clean.isdigit())):
+                                       (len(word_clean) <= 3 and word_clean.isdigit())):
             cleaned_words.append(word_clean)
         elif not cleaned_words:
-            # Если еще нет имен, но слово начинается с заглавной - возможно имя
             if word_clean[0].isupper() and word_clean.replace('-', '').isalpha():
                 cleaned_words.append(word_clean)
     
-    # Если нашли очищенные слова, возвращаем их
     if cleaned_words:
         result = ' '.join(cleaned_words)
-        # Ограничиваем длину (имена обычно не длиннее 50 символов)
         if len(result) > 50:
             result = result[:50]
         return result
     
-    # Если не удалось очистить, возвращаем первое слово (до пробела/переноса строки)
     first_word = words[0] if words else text
     first_word = first_word.strip('.,!?;:()[]{}"\'-')
     
-    # Ограничиваем длину имени
     if len(first_word) > 50:
         first_word = first_word[:50]
     
@@ -361,18 +189,13 @@ def clean_address_text(text: str) -> str:
     if not text:
         return text
     
-    # Удаляем переносы строк и лишние пробелы
     text = re.sub(r'\s+', ' ', text.strip())
-    
-    # Удаляем лишние знаки препинания в конце
     text = text.rstrip('.,!?;:')
     
-    # Ограничиваем длину адреса (обычно адреса не длиннее 200 символов)
     if len(text) > 200:
-        # Пытаемся найти естественную границу (запятая, точка)
         for delimiter in [',', '.', ';']:
             idx = text[:200].rfind(delimiter)
-            if idx > 100:  # Если нашли разделитель не слишком близко к началу
+            if idx > 100:
                 text = text[:idx].strip()
                 break
         else:
@@ -381,85 +204,7 @@ def clean_address_text(text: str) -> str:
     return text
 
 
-def filter_and_clean_results(results: List[RecognizerResult], text: str) -> List[RecognizerResult]:
-    """Фильтрует результаты распознавания имен и адресов по качеству"""
-    filtered_results = []
-    
-    for result in results:
-        # Для имен применяем дополнительную фильтрацию
-        if result.entity_type in ["PERSON", "PER"]:
-            # Получаем захваченный текст
-            captured_text = text[result.start:result.end]
-            
-            # Проверяем длину (имена обычно не длиннее 50 символов)
-            if len(captured_text) > 50:
-                continue  # Пропускаем слишком длинные результаты
-            
-            # Проверяем наличие стоп-слов в середине текста
-            # (если стоп-слово в начале, это нормально - может быть частью контекста)
-            stop_words = ['время', 'место', 'номер', 'телефон', 'адрес']
-            text_lower = captured_text.lower()
-            
-            # Если в тексте есть стоп-слово не в начале - пропускаем
-            has_stop_word = False
-            for stop_word in stop_words:
-                idx = text_lower.find(stop_word)
-                if idx > 0:  # Стоп-слово не в начале
-                    has_stop_word = True
-                    break
-            
-            if has_stop_word:
-                continue  # Пропускаем результаты со стоп-словами
-            
-            # Проверяем наличие переносов строк (обычно имена не содержат переносы)
-            if '\n' in captured_text:
-                # Если есть перенос строки, берем только первую часть
-                first_line = captured_text.split('\n')[0].strip()
-                if first_line and len(first_line) <= 50:
-                    # Создаем новый результат только для первой строки
-                    new_start = result.start
-                    new_end = result.start + len(first_line)
-                    new_result = RecognizerResult(
-                        entity_type=result.entity_type,
-                        start=new_start,
-                        end=new_end,
-                        score=result.score
-                    )
-                    filtered_results.append(new_result)
-                continue
-            
-            # Если все проверки пройдены, добавляем результат
-            filtered_results.append(result)
-        elif result.entity_type in ["ADDRESS", "LOCATION"]:
-            # Для адресов применяем фильтрацию по длине
-            captured_text = text[result.start:result.end]
-            
-            # Проверяем длину (адреса обычно не длиннее 200 символов)
-            if len(captured_text) > 200:
-                # Пытаемся обрезать до разумной длины
-                # Ищем последнюю запятую или точку в первых 200 символах
-                trimmed_text = captured_text[:200]
-                for delimiter in [',', '.', ';']:
-                    idx = trimmed_text.rfind(delimiter)
-                    if idx > 50:  # Если нашли разделитель не слишком близко к началу
-                        new_end = result.start + idx
-                        result = RecognizerResult(
-                            entity_type=result.entity_type,
-                            start=result.start,
-                            end=new_end,
-                            score=result.score
-                        )
-                        break
-            
-            filtered_results.append(result)
-        else:
-            # Для других типов сущностей оставляем как есть
-            filtered_results.append(result)
-    
-    return filtered_results
-
-
-# --- Логика управления метками (Stateful per request) ---
+# --- Логика управления метками ---
 
 class RequestAnonymizer:
     """Класс для обработки одного конкретного запроса"""
@@ -468,35 +213,37 @@ class RequestAnonymizer:
         self.counters = {}
         self.mapping = {}
         self.label_map = {
-            "PERSON": "ИМЯ",
             "PER": "ИМЯ",
+            "PERSON": "ИМЯ",
+            "ORG": "ОРГАНИЗАЦИЯ",
+            "LOC": "АДРЕС",
             "PHONE_NUMBER": "ТЕЛЕФОН",
             "INN": "ИНН",
             "PASSPORT": "ПАСПОРТ",
-            "LOCATION": "АДРЕС",
-            "ADDRESS": "АДРЕС"
+            "ADDRESS": "АДРЕС",
+            "LOCATION": "АДРЕС"
         }
 
-    def get_replacement(self, original_text, entity_type):
+    def get_replacement(self, original_text: str, entity_type: str) -> str:
+        """Получает метку-замену для сущности"""
         ru_label = self.label_map.get(entity_type, entity_type)
+        
         if ru_label not in self.counters:
             self.counters[ru_label] = 1
-
+        
         placeholder = f"{{{ru_label}_{self.counters[ru_label]}}}"
-
-        # Сохраняем маппинг
+        
         if placeholder not in self.mapping:
-            # Для имен применяем очистку текста
             if entity_type in ["PERSON", "PER"]:
                 cleaned_text = clean_name_text(original_text)
                 self.mapping[placeholder] = cleaned_text if cleaned_text else original_text
-            elif entity_type in ["ADDRESS", "LOCATION"]:
-                # Для адресов также применяем очистку
+            elif entity_type in ["ADDRESS", "LOCATION", "LOC"]:
                 cleaned_text = clean_address_text(original_text)
                 self.mapping[placeholder] = cleaned_text if cleaned_text else original_text
             else:
                 self.mapping[placeholder] = original_text
             self.counters[ru_label] += 1
+        
         return placeholder
 
 
@@ -521,43 +268,300 @@ class DeanonymizeResponse(BaseModel):
     restored_text: str
 
 
+# --- Основная функция распознавания ---
+
+def recognize_entities_with_deeppavlov(text: str) -> List[Dict]:
+    """Распознает сущности используя DeepPavlov NER модель"""
+    results = []
+    
+    if ner_model:
+        try:
+            # DeepPavlov ожидает список предложений
+            # Разбиваем текст на предложения для лучшей обработки
+            sentence_endings = re.finditer(r'[.!?]\s+', text)
+            sentence_starts = [0]
+            sentence_ends = []
+            
+            for match in sentence_endings:
+                sentence_ends.append(match.end())
+                sentence_starts.append(match.end())
+            sentence_ends.append(len(text))
+            
+            # Обрабатываем каждое предложение
+            for i in range(len(sentence_starts)):
+                start_pos = sentence_starts[i]
+                end_pos = sentence_ends[i] if i < len(sentence_ends) else len(text)
+                sentence = text[start_pos:end_pos].strip()
+                
+                if not sentence:
+                    continue
+                
+                try:
+                    # Применяем модель NER
+                    model_result = ner_model([sentence])
+                    
+                    # Результат может быть в разных форматах
+                    if isinstance(model_result, list) and len(model_result) > 0:
+                        if isinstance(model_result[0], tuple) and len(model_result[0]) == 2:
+                            tokens, tags = model_result[0]
+                        elif isinstance(model_result[0], list):
+                            tokens = model_result[0]
+                            tags = model_result[1] if len(model_result) > 1 else []
+                        else:
+                            continue
+                    else:
+                        continue
+                    
+                    # Обрабатываем результаты BIO тегов
+                    current_entity = None
+                    current_tokens = []
+                    current_start_in_sentence = 0
+                    
+                    # Восстанавливаем позиции токенов в предложении
+                    sentence_lower = sentence.lower()
+                    token_positions = []
+                    search_pos = 0
+                    
+                    for token in tokens:
+                        token_lower = token.lower()
+                        # Ищем токен в предложении
+                        pos = sentence_lower.find(token_lower, search_pos)
+                        if pos == -1:
+                            # Если не нашли точное совпадение, используем приблизительную позицию
+                            pos = search_pos
+                        token_positions.append((pos, pos + len(token)))
+                        search_pos = pos + len(token)
+                    
+                    # Обрабатываем теги
+                    for i, (token, tag, (token_start, token_end)) in enumerate(zip(tokens, tags, token_positions)):
+                        # Обрабатываем теги BIO
+                        if tag and (tag.startswith('B-') or tag.startswith('I-')):
+                            entity_type = tag[2:]  # Убираем префикс B- или I-
+                            
+                            if tag.startswith('B-') or current_entity != entity_type:
+                                # Сохраняем предыдущую сущность если есть
+                                if current_entity and current_tokens:
+                                    entity_text = ' '.join(current_tokens)
+                                    entity_start_in_text = start_pos + current_start_in_sentence
+                                    entity_end_in_text = entity_start_in_text + len(entity_text)
+                                    
+                                    # Для LOC (локаций) расширяем контекст для захвата номеров домов
+                                    if current_entity == "LOC":
+                                        expanded_text = entity_text
+                                        expanded_end = entity_end_in_text
+                                        
+                                        # Ищем номер дома после локации
+                                        context_after = sentence[entity_end_in_text - start_pos:entity_end_in_text - start_pos + 30]
+                                        number_match = re.search(r'\s+(?:д\.?\s*)?(\d+[А-ЯЁа-яё]?)', context_after)
+                                        if number_match:
+                                            expanded_text = entity_text + number_match.group()
+                                            expanded_end = entity_end_in_text + len(number_match.group())
+                                        
+                                        # Ищем номер перед локацией
+                                        if not any(char.isdigit() for char in entity_text):
+                                            context_before = sentence[max(0, entity_start_in_text - start_pos - 20):entity_start_in_text - start_pos]
+                                            number_match_before = re.search(r'(\d+(?:-я|-й|-е|-ая|-ый|-ое)?)\s+', context_before)
+                                            if number_match_before:
+                                                expanded_text = number_match_before.group(1) + ' ' + expanded_text
+                                                expanded_start = entity_start_in_text - len(number_match_before.group(1)) - 1
+                                                entity_start_in_text = max(start_pos, expanded_start)
+                                        
+                                        results.append({
+                                            "entity": "ADDRESS",  # LOC -> ADDRESS
+                                            "start": entity_start_in_text,
+                                            "end": expanded_end,
+                                            "text": expanded_text,
+                                            "score": 0.9
+                                        })
+                                    else:
+                                        results.append({
+                                            "entity": current_entity,
+                                            "start": entity_start_in_text,
+                                            "end": entity_end_in_text,
+                                            "text": entity_text,
+                                            "score": 0.85
+                                        })
+                                
+                                # Начинаем новую сущность
+                                current_entity = entity_type
+                                current_tokens = [token]
+                                current_start_in_sentence = token_start
+                            else:
+                                # Продолжаем текущую сущность
+                                current_tokens.append(token)
+                        else:
+                            # Сохраняем предыдущую сущность если есть
+                            if current_entity and current_tokens:
+                                entity_text = ' '.join(current_tokens)
+                                entity_start_in_text = start_pos + current_start_in_sentence
+                                entity_end_in_text = entity_start_in_text + len(entity_text)
+                                
+                                # Для LOC (локаций) расширяем контекст для захвата номеров домов
+                                if current_entity == "LOC":
+                                    expanded_text = entity_text
+                                    expanded_end = entity_end_in_text
+                                    
+                                    # Ищем номер дома после локации
+                                    context_after = sentence[entity_end_in_text - start_pos:entity_end_in_text - start_pos + 30]
+                                    number_match = re.search(r'\s+(?:д\.?\s*)?(\d+[А-ЯЁа-яё]?)', context_after)
+                                    if number_match:
+                                        expanded_text = entity_text + number_match.group()
+                                        expanded_end = entity_end_in_text + len(number_match.group())
+                                    
+                                    # Ищем номер перед локацией
+                                    if not any(char.isdigit() for char in entity_text):
+                                        context_before = sentence[max(0, entity_start_in_text - start_pos - 20):entity_start_in_text - start_pos]
+                                        number_match_before = re.search(r'(\d+(?:-я|-й|-е|-ая|-ый|-ое)?)\s+', context_before)
+                                        if number_match_before:
+                                            expanded_text = number_match_before.group(1) + ' ' + expanded_text
+                                            expanded_start = entity_start_in_text - len(number_match_before.group(1)) - 1
+                                            entity_start_in_text = max(start_pos, expanded_start)
+                                    
+                                    results.append({
+                                        "entity": "ADDRESS",  # LOC -> ADDRESS
+                                        "start": entity_start_in_text,
+                                        "end": expanded_end,
+                                        "text": expanded_text,
+                                        "score": 0.9
+                                    })
+                                else:
+                                    results.append({
+                                        "entity": current_entity,
+                                        "start": entity_start_in_text,
+                                        "end": entity_end_in_text,
+                                        "text": entity_text,
+                                        "score": 0.85
+                                    })
+                            
+                            current_entity = None
+                            current_tokens = []
+                    
+                    # Сохраняем последнюю сущность если есть
+                    if current_entity and current_tokens:
+                        entity_text = ' '.join(current_tokens)
+                        entity_start_in_text = start_pos + current_start_in_sentence
+                        entity_end_in_text = entity_start_in_text + len(entity_text)
+                        
+                        # Для LOC (локаций) расширяем контекст для захвата номеров домов
+                        if current_entity == "LOC":
+                            # Ищем номера домов рядом с локацией
+                            expanded_text = entity_text
+                            expanded_end = entity_end_in_text
+                            
+                            # Ищем номер дома после локации (в пределах 30 символов)
+                            context_after = sentence[entity_end_in_text - start_pos:entity_end_in_text - start_pos + 30]
+                            number_match = re.search(r'\s+(?:д\.?\s*)?(\d+[А-ЯЁа-яё]?)', context_after)
+                            if number_match:
+                                expanded_text = entity_text + number_match.group()
+                                expanded_end = entity_end_in_text + len(number_match.group())
+                            
+                            # Ищем номер перед локацией (если локация не содержит цифр)
+                            if not any(char.isdigit() for char in entity_text):
+                                context_before = sentence[max(0, entity_start_in_text - start_pos - 20):entity_start_in_text - start_pos]
+                                number_match_before = re.search(r'(\d+(?:-я|-й|-е|-ая|-ый|-ое)?)\s+', context_before)
+                                if number_match_before:
+                                    expanded_text = number_match_before.group(1) + ' ' + expanded_text
+                                    expanded_start = entity_start_in_text - len(number_match_before.group(1)) - 1
+                                    entity_start_in_text = max(start_pos, expanded_start)
+                            
+                            results.append({
+                                "entity": "ADDRESS",  # LOC -> ADDRESS
+                                "start": entity_start_in_text,
+                                "end": expanded_end,
+                                "text": expanded_text,
+                                "score": 0.9  # Высокий score для адресов из NER
+                            })
+                        else:
+                            results.append({
+                                "entity": current_entity,
+                                "start": entity_start_in_text,
+                                "end": entity_end_in_text,
+                                "text": entity_text,
+                                "score": 0.85
+                            })
+                
+                except Exception as e:
+                    print(f"Ошибка при обработке предложения '{sentence[:50]}...': {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+        
+        except Exception as e:
+            print(f"Ошибка при использовании DeepPavlov модели: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    return results
+
+
+def recognize_entities(text: str) -> List[Dict]:
+    """Распознает все сущности в тексте используя DeepPavlov NER и паттерны"""
+    all_results = []
+    
+    # 1. Используем DeepPavlov NER модель
+    deeppavlov_results = recognize_entities_with_deeppavlov(text)
+    
+    # Маппинг типов сущностей из DeepPavlov
+    # LOC уже обработан как ADDRESS в recognize_entities_with_deeppavlov
+    for result in deeppavlov_results:
+        entity_type = result["entity"]
+        # PER и ADDRESS уже правильно обработаны
+        if entity_type != "ORG":  # Пропускаем организации
+            all_results.append(result)
+    
+    # 2. Используем паттерны для дополнительного распознавания
+    pattern_results = pattern_recognizer.recognize(text)
+    all_results.extend(pattern_results)
+    
+    # 3. Объединяем результаты, удаляя дубликаты
+    # Сортируем по позиции начала
+    all_results = sorted(all_results, key=lambda x: (x["start"], -x["score"]))
+    
+    # Удаляем перекрывающиеся результаты (оставляем с большим score)
+    filtered_results = []
+    
+    for result in all_results:
+        overlaps = False
+        for existing in filtered_results:
+            if not (result["end"] <= existing["start"] or result["start"] >= existing["end"]):
+                overlaps = True
+                if result["score"] > existing["score"]:
+                    filtered_results.remove(existing)
+                    filtered_results.append(result)
+                break
+        
+        if not overlaps:
+            filtered_results.append(result)
+    
+    return sorted(filtered_results, key=lambda x: x["start"])
+
+
 # --- Эндпоинты ---
 
 @app.post("/anonymize", response_model=AnonymizeResponse)
 async def anonymize_text(req: AnonymizeRequest):
     start_time = time.time()
 
-    # Создаем менеджер меток для текущего запроса
     manager = RequestAnonymizer()
 
-    # Анализ
-    results = analyzer.analyze(
-        text=req.text,
-        language='ru',
-        entities=["PERSON", "PER", "PHONE_NUMBER", "INN", "PASSPORT", "LOCATION", "ADDRESS"]
-    )
+    # Распознаем сущности
+    entities = recognize_entities(req.text)
     
-    # Фильтруем и очищаем результаты распознавания имен
-    results = filter_and_clean_results(results, req.text)
-    
-    # Сортируем по позиции начала
-    results = sorted(results, key=lambda x: x.start)
-
-    # Анонимизация
-    # Используем default аргумент в lambda, чтобы передать entity_type правильно
-    operators = {
-        ent: OperatorConfig("custom", {"lambda": lambda x, et=ent: manager.get_replacement(x, et)})
-        for ent in ["PERSON", "PER", "PHONE_NUMBER", "INN", "PASSPORT", "LOCATION", "ADDRESS"]
-    }
-
-    anonymized_result = anonymizer_engine.anonymize(
-        text=req.text,
-        analyzer_results=results,
-        operators=operators
-    )
+    # Создаем анонимизированный текст
+    anonymized_text = req.text
+    # Заменяем с конца, чтобы не сбить индексы
+    for entity in reversed(entities):
+        entity_type = entity["entity"]
+        original_text = entity["text"]
+        placeholder = manager.get_replacement(original_text, entity_type)
+        
+        start = entity["start"]
+        end = entity["end"]
+        
+        anonymized_text = anonymized_text[:start] + placeholder + anonymized_text[end:]
 
     return AnonymizeResponse(
-        anonymized_text=anonymized_result.text,
+        anonymized_text=anonymized_text,
         mapping=manager.mapping,
         processing_time=time.time() - start_time
     )
@@ -567,15 +571,23 @@ async def anonymize_text(req: AnonymizeRequest):
 async def deanonymize_text(req: DeanonymizeRequest):
     text = req.text
     mapping = req.mapping
-    # Сортируем ключи по длине (от длинных к коротким), чтобы не сломать замену
-    # (например, чтобы {ИМЯ_10} не превратилось в значение {ИМЯ_1} + "0")
+    
     for placeholder in sorted(mapping.keys(), key=len, reverse=True):
         text = text.replace(placeholder, mapping[placeholder])
 
     return DeanonymizeResponse(restored_text=text)
 
 
+@app.get("/health")
+async def health_check():
+    """Проверка здоровья сервиса"""
+    return {
+        "status": "ok",
+        "model_loaded": ner_model is not None,
+        "deeppavlov_available": DEEPPAVLOV_AVAILABLE
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)

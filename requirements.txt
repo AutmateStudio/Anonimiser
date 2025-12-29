@@ -1,11 +1,9 @@
-transformers
 python-docx
 requests
 pandas
 openpyxl
 fastapi
 uvicorn
-presidio-analyzer
-presidio-anonymizer
-spacy
 pytest
+deeppavlov
+torch
