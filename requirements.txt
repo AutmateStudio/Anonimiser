@@ -8,3 +8,4 @@ uvicorn
 presidio-analyzer
 presidio-anonymizer
 spacy
+pytest
